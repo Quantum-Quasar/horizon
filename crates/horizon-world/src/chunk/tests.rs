@@ -597,3 +597,236 @@ fn a_block_entity_saved_in_another_chunk_moves_into_this_one() {
         (-27, 70, 93)
     );
 }
+
+fn baseline_paletted_to_nbt(container: &PalettedContainer) -> Tag {
+    let mut map = container.extra.clone();
+    let mut palette: Vec<&Tag> = Vec::with_capacity(container.palette.len());
+    let mut seen: HashMap<&Tag, u32> = HashMap::with_capacity(container.palette.len());
+    let mut ids = Vec::with_capacity(container.entries);
+    for index in 0..container.entries {
+        let id = container
+            .storage
+            .as_ref()
+            .map_or(0, |s| s.get(index).unwrap()) as usize;
+        let value = &container.palette[id];
+        ids.push(*seen.entry(value).or_insert_with(|| {
+            palette.push(value);
+            palette.len() as u32 - 1
+        }));
+    }
+    let bits = bits_for_palette(palette.len(), container.min_bits);
+    map.insert(
+        key("palette"),
+        Tag::List(palette.into_iter().cloned().collect()),
+    );
+    if bits > 0 {
+        let mut storage = PackedStorage::new(bits, container.entries).unwrap();
+        for (index, id) in ids.into_iter().enumerate() {
+            storage.set(index, id).unwrap();
+        }
+        map.insert(
+            key("data"),
+            Tag::LongArray(storage.words().iter().map(|&v| v as i64).collect()),
+        );
+    }
+    Tag::Compound(map)
+}
+
+fn baseline_paletted_compact(container: &mut PalettedContainer) -> io::Result<()> {
+    let values = (0..container.entries)
+        .map(|i| container.get(i).cloned())
+        .collect::<io::Result<Vec<_>>>()?;
+    let mut compact =
+        PalettedContainer::uniform(values[0].clone(), container.entries, container.min_bits)?;
+    for (i, value) in values.into_iter().enumerate() {
+        compact.set(i, value)?;
+    }
+    compact.extra = std::mem::take(&mut container.extra);
+    *container = compact;
+    Ok(())
+}
+
+fn baseline_section_compact(section: &mut BlockSection<'_>) -> io::Result<()> {
+    let values: Vec<_> = (0..4096).map(|i| section.get(i).unwrap()).collect();
+    section.palette.clear();
+    section.last = None;
+    section.counts.clear();
+    section.free.clear();
+    for state in &values {
+        if let Some(id) = id_in(&section.palette, &section.counts, &mut section.last, *state) {
+            section.counts[id as usize] += 1;
+        } else {
+            section.palette.push(*state);
+            section.counts.push(1);
+            section.last = Some((*state, section.palette.len() as u32 - 1));
+        }
+    }
+    let bits = bits_for_palette(section.palette.len(), 4);
+    section.storage = if bits == 0 {
+        None
+    } else {
+        let mut storage = PackedStorage::new(bits, 4096).map_err(|e| invalid(e.to_string()))?;
+        let mut last = None;
+        for (i, state) in values.iter().enumerate() {
+            let id = id_in(&section.palette, &section.counts, &mut last, *state).unwrap();
+            storage.set(i, id).unwrap();
+        }
+        Some(storage)
+    };
+    Ok(())
+}
+
+#[test]
+fn paletted_to_nbt_and_compact_match_baseline() {
+    let registry = benchmark_registry(64);
+    let make_tag = |i: u32| registry.state(BlockStateId(i)).unwrap().to_nbt();
+
+    // Mixed container with dead slots + extra field.
+    let mut pc = PalettedContainer::uniform(make_tag(0), 4096, 4).unwrap();
+    for i in 0..4096 {
+        pc.set(i, make_tag((i % 24) as u32)).unwrap();
+    }
+    // Overwrite state 23 so it becomes unused.
+    for i in (23..4096).step_by(24) {
+        pc.set(i, make_tag(0)).unwrap();
+    }
+    assert_eq!(pc.to_nbt(), baseline_paletted_to_nbt(&pc));
+
+    let mut pc_base = pc.clone();
+    let mut pc_fast = pc.clone();
+    baseline_paletted_compact(&mut pc_base).unwrap();
+    pc_fast.compact().unwrap();
+    assert_eq!(pc_fast.to_nbt(), pc_base.to_nbt());
+    assert_eq!(pc_fast.palette_len(), pc_base.palette_len());
+    assert_eq!(pc_fast.bits(), pc_base.bits());
+
+    // BlockSection::compact matches baseline palette, counts, free, and storage.
+    let mut sec_base = BlockSection::uniform(BlockStateId(0), &registry).unwrap();
+    let mut sec_fast = BlockSection::uniform(BlockStateId(0), &registry).unwrap();
+    for i in 0..4096 {
+        let s = BlockStateId(((i * 7) % 24) as u32);
+        sec_base.set(i, s).unwrap();
+        sec_fast.set(i, s).unwrap();
+    }
+    for i in 0..4096 {
+        if sec_base.get(i).unwrap() == BlockStateId(23) {
+            sec_base.set(i, BlockStateId(0)).unwrap();
+            sec_fast.set(i, BlockStateId(0)).unwrap();
+        }
+    }
+    baseline_section_compact(&mut sec_base).unwrap();
+    sec_fast.compact().unwrap();
+    assert_fields(&sec_fast, &sec_base, "compact");
+}
+
+#[test]
+#[ignore = "microbenchmark: cargo test --release -p horizon-world --lib chunk::tests::benchmark_pack_and_compact -- --ignored --nocapture"]
+fn benchmark_pack_and_compact() {
+    use std::hint::black_box;
+    use std::time::Instant;
+
+    const ROUNDS: u32 = 31;
+    const ITERS: usize = 200;
+    let registry = benchmark_registry(64);
+    let make_tag = |i: u32| registry.state(BlockStateId(i)).unwrap().to_nbt();
+
+    let mut pc = PalettedContainer::uniform(make_tag(0), 4096, 4).unwrap();
+    let mut section = BlockSection::uniform(BlockStateId(0), &registry).unwrap();
+    let mut rng = 0x9e37_79b9_7f4a_7c15u64;
+    for i in 0..4096 {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        let id = (rng as u32) % 24;
+        pc.set(i, make_tag(id)).unwrap();
+        section.set(i, BlockStateId(id)).unwrap();
+    }
+
+    // 1. PalettedContainer::to_nbt
+    let mut times = [Vec::new(), Vec::new()];
+    for round in 0..ROUNDS {
+        for optimized in [round % 2 == 0, round % 2 != 0] {
+            let started = Instant::now();
+            for _ in 0..ITERS {
+                let tag = if optimized {
+                    black_box(&pc).to_nbt()
+                } else {
+                    baseline_paletted_to_nbt(black_box(&pc))
+                };
+                black_box(tag);
+            }
+            if round > 0 {
+                times[usize::from(optimized)]
+                    .push(started.elapsed().as_secs_f64() * 1e6 / ITERS as f64);
+            }
+        }
+    }
+    for v in &mut times {
+        v.sort_by(f64::total_cmp);
+    }
+    let median = |v: &[f64]| v[v.len() / 2];
+    println!(
+        "PalettedContainer::to_nbt  (24 states): baseline {:7.3} us/op  optimized {:7.3} us/op  speedup {:6.2}x",
+        median(&times[0]),
+        median(&times[1]),
+        median(&times[0]) / median(&times[1])
+    );
+
+    // 2. PalettedContainer::compact
+    let mut ctimes = [Vec::new(), Vec::new()];
+    for round in 0..ROUNDS {
+        for optimized in [round % 2 == 0, round % 2 != 0] {
+            let mut clones: Vec<_> = (0..50).map(|_| pc.clone()).collect();
+            let started = Instant::now();
+            for c in &mut clones {
+                if optimized {
+                    c.compact().unwrap();
+                } else {
+                    baseline_paletted_compact(c).unwrap();
+                }
+                black_box(c);
+            }
+            if round > 0 {
+                ctimes[usize::from(optimized)].push(started.elapsed().as_secs_f64() * 1e6 / 50.0);
+            }
+        }
+    }
+    for v in &mut ctimes {
+        v.sort_by(f64::total_cmp);
+    }
+    println!(
+        "PalettedContainer::compact (24 states): baseline {:7.3} us/op  optimized {:7.3} us/op  speedup {:6.2}x",
+        median(&ctimes[0]),
+        median(&ctimes[1]),
+        median(&ctimes[0]) / median(&ctimes[1])
+    );
+
+    // 3. BlockSection::compact
+    let mut stimes = [Vec::new(), Vec::new()];
+    for round in 0..ROUNDS {
+        for optimized in [round % 2 == 0, round % 2 != 0] {
+            let started = Instant::now();
+            for _ in 0..ITERS {
+                if optimized {
+                    section.compact().unwrap();
+                } else {
+                    baseline_section_compact(&mut section).unwrap();
+                }
+                black_box(&section);
+            }
+            if round > 0 {
+                stimes[usize::from(optimized)]
+                    .push(started.elapsed().as_secs_f64() * 1e6 / ITERS as f64);
+            }
+        }
+    }
+    for v in &mut stimes {
+        v.sort_by(f64::total_cmp);
+    }
+    println!(
+        "BlockSection::compact      (24 states): baseline {:7.3} us/op  optimized {:7.3} us/op  speedup {:6.2}x",
+        median(&stimes[0]),
+        median(&stimes[1]),
+        median(&stimes[0]) / median(&stimes[1])
+    );
+}
