@@ -266,7 +266,11 @@ impl Heightmap {
         }
         let min_y = chunk.min_y();
         let upper = chunk.highest_section_y().wrapping_add(16);
-        if maps.len() <= 64 && upper >= min_y && (upper.wrapping_sub(min_y) & 15) == 0 {
+        if maps.len() <= 64
+            && upper >= min_y
+            && upper <= min_y.saturating_add(chunk.height())
+            && (upper.wrapping_sub(min_y) & 15) == 0
+        {
             let full_mask = if maps.len() == 64 {
                 u64::MAX
             } else {
