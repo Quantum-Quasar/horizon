@@ -230,11 +230,30 @@ fn palette_ids(values: &[u32]) -> (Vec<u32>, Vec<u32>) {
     }
     (palette, ids)
 }
-/// Words holding `ids` in `bits`-wide slots.
-fn pack_words(bits: u8, entries: usize, ids: impl Iterator<Item = u32>) -> Vec<u64> {
-    let mut words = vec![0u64; storage_len(bits, entries)];
-    for (i, id) in ids.enumerate() {
-        write(&mut words, bits, i, id);
+/// Words holding `ids` in `bits`-wide slots, assembled one 64-bit word at a
+/// time instead of locating and read-modify-writing each slot individually.
+fn pack_words(bits: u8, entries: usize, mut ids: impl Iterator<Item = u32>) -> Vec<u64> {
+    let word_count = storage_len(bits, entries);
+    if word_count == 0 {
+        return Vec::new();
+    }
+    let per = 64 / usize::from(bits);
+    let step = u32::from(bits);
+    let mut words = Vec::with_capacity(word_count);
+    let mut remaining = entries;
+    while remaining > 0 {
+        let count = remaining.min(per);
+        let mut word = 0u64;
+        let mut shift = 0u32;
+        for _ in 0..count {
+            let Some(id) = ids.next() else {
+                break;
+            };
+            word |= u64::from(id) << shift;
+            shift += step;
+        }
+        words.push(word);
+        remaining -= count;
     }
     words
 }
@@ -568,39 +587,110 @@ impl PalettedContainer {
         self.words = words;
         id as usize
     }
+    #[inline(always)]
+    fn unpack_mapped_fixed<const BITS: u32, const PER: usize, T: Copy>(
+        words: &[u64],
+        out: &mut [T],
+        map: &[T],
+    ) {
+        let m = (1u64 << BITS) - 1;
+        let (chunks, tail) = out.as_chunks_mut::<PER>();
+        for (&word, chunk) in words.iter().zip(chunks.iter_mut()) {
+            let mut w = word;
+            for cell in chunk {
+                *cell = map[(w & m) as usize];
+                w >>= BITS;
+            }
+        }
+        if !tail.is_empty() {
+            let mut w = words[chunks.len()];
+            for cell in tail {
+                *cell = map[(w & m) as usize];
+                w >>= BITS;
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn unpack_global_fixed<const BITS: u32, const PER: usize>(words: &[u64], out: &mut [u32]) {
+        let m = (1u64 << BITS) - 1;
+        let (chunks, tail) = out.as_chunks_mut::<PER>();
+        for (&word, chunk) in words.iter().zip(chunks.iter_mut()) {
+            let mut w = word;
+            for cell in chunk {
+                *cell = (w & m) as u32;
+                w >>= BITS;
+            }
+        }
+        if !tail.is_empty() {
+            let mut w = words[chunks.len()];
+            for cell in tail {
+                *cell = (w & m) as u32;
+                w >>= BITS;
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn unpack_ids_fixed<const BITS: u32, const PER: usize>(words: &[u64], ids: &mut [u16]) {
+        let m = (1u64 << BITS) - 1;
+        let (chunks, tail) = ids.as_chunks_mut::<PER>();
+        for (&word, chunk) in words.iter().zip(chunks.iter_mut()) {
+            let mut w = word;
+            for cell in chunk {
+                *cell = (w & m) as u16;
+                w >>= BITS;
+            }
+        }
+        if !tail.is_empty() {
+            let mut w = words[chunks.len()];
+            for cell in tail {
+                *cell = (w & m) as u16;
+                w >>= BITS;
+            }
+        }
+    }
+
     /// All values in index order.
     pub fn unpack(&self, out: &mut [u32]) {
         assert_eq!(out.len(), self.strategy.entries());
         match &self.palette {
             Palette::Single(value) => out.fill(*value),
-            Palette::List(list) if self.bits == 4 => {
-                for (row, &word) in out.as_chunks_mut::<16>().0.iter_mut().zip(&self.words) {
-                    for (x, cell) in row.iter_mut().enumerate() {
-                        *cell = list[((word >> (x * 4)) & 15) as usize];
+            Palette::List(list) => match self.bits {
+                4 => Self::unpack_mapped_fixed::<4, 16, u32>(&self.words, out, list),
+                5 => Self::unpack_mapped_fixed::<5, 12, u32>(&self.words, out, list),
+                6 => Self::unpack_mapped_fixed::<6, 10, u32>(&self.words, out, list),
+                7 => Self::unpack_mapped_fixed::<7, 9, u32>(&self.words, out, list),
+                8 => Self::unpack_mapped_fixed::<8, 8, u32>(&self.words, out, list),
+                bits => {
+                    let per = 64 / usize::from(bits);
+                    let m = mask(bits);
+                    let shift = u32::from(bits);
+                    for (chunk, &word) in out.chunks_mut(per).zip(&self.words) {
+                        let mut w = word;
+                        for cell in chunk {
+                            *cell = list[(w & m) as usize];
+                            w >>= shift;
+                        }
                     }
                 }
-            }
-            Palette::List(list) => {
-                let bits = usize::from(self.bits);
-                let per = 64 / bits;
-                let m = mask(self.bits);
-                for (chunk, &word) in out.chunks_mut(per).zip(&self.words) {
-                    for (slot, cell) in chunk.iter_mut().enumerate() {
-                        let id = ((word >> (slot * bits)) & m) as usize;
-                        *cell = list[id];
+            },
+            Palette::Global => match self.bits {
+                15 => Self::unpack_global_fixed::<15, 4>(&self.words, out),
+                16 => Self::unpack_global_fixed::<16, 4>(&self.words, out),
+                bits => {
+                    let per = 64 / usize::from(bits);
+                    let m = mask(bits);
+                    let shift = u32::from(bits);
+                    for (chunk, &word) in out.chunks_mut(per).zip(&self.words) {
+                        let mut w = word;
+                        for cell in chunk {
+                            *cell = (w & m) as u32;
+                            w >>= shift;
+                        }
                     }
                 }
-            }
-            Palette::Global => {
-                let bits = usize::from(self.bits);
-                let per = 64 / bits;
-                let m = mask(self.bits);
-                for (chunk, &word) in out.chunks_mut(per).zip(&self.words) {
-                    for (slot, cell) in chunk.iter_mut().enumerate() {
-                        *cell = ((word >> (slot * bits)) & m) as u32;
-                    }
-                }
-            }
+            },
         }
     }
     /// The stored ids through `map`: `out[i] = map[id of entry i]`, in index
@@ -609,27 +699,24 @@ impl PalettedContainer {
     /// stores no ids: `out` is left as it is.
     pub fn unpack_ids_mapped<T: Copy>(&self, out: &mut [T], map: &[T]) {
         assert_eq!(out.len(), self.strategy.entries());
-        // Four bits a linear palette's usual width: a whole word of them is a
-        // row of 16, and immediate shifts for the compiler to unroll.
-        if self.bits == 4 {
-            for (row, &word) in out.as_chunks_mut::<16>().0.iter_mut().zip(&self.words) {
-                for (x, cell) in row.iter_mut().enumerate() {
-                    *cell = map[((word >> (x * 4)) & 0xF) as usize];
+        match self.bits {
+            0 => {}
+            4 => Self::unpack_mapped_fixed::<4, 16, T>(&self.words, out, map),
+            5 => Self::unpack_mapped_fixed::<5, 12, T>(&self.words, out, map),
+            6 => Self::unpack_mapped_fixed::<6, 10, T>(&self.words, out, map),
+            7 => Self::unpack_mapped_fixed::<7, 9, T>(&self.words, out, map),
+            8 => Self::unpack_mapped_fixed::<8, 8, T>(&self.words, out, map),
+            bits => {
+                let per = 64 / usize::from(bits);
+                let m = mask(bits);
+                let shift = u32::from(bits);
+                for (chunk, &word) in out.chunks_mut(per).zip(&self.words) {
+                    let mut w = word;
+                    for cell in chunk {
+                        *cell = map[(w & m) as usize];
+                        w >>= shift;
+                    }
                 }
-            }
-            return;
-        }
-        if self.bits == 0 {
-            return;
-        }
-        let bits = usize::from(self.bits);
-        let per = 64 / bits;
-        let m = mask(self.bits);
-        for (chunk, &word) in out.chunks_mut(per).zip(&self.words) {
-            let mut shift = 0;
-            for cell in chunk {
-                *cell = map[((word >> shift) & m) as usize];
-                shift += bits;
             }
         }
     }
@@ -641,13 +728,23 @@ impl PalettedContainer {
             return None;
         };
         assert_eq!(ids.len(), self.strategy.entries());
-        let bits = usize::from(self.bits);
-        let per = 64 / bits;
-        let m = mask(self.bits);
-        for (chunk, &word) in ids.chunks_mut(per).zip(&self.words) {
-            for (slot, cell) in chunk.iter_mut().enumerate() {
-                // List palettes stay at a few bits (eight at most for blocks).
-                *cell = ((word >> (slot * bits)) & m) as u16;
+        match self.bits {
+            4 => Self::unpack_ids_fixed::<4, 16>(&self.words, ids),
+            5 => Self::unpack_ids_fixed::<5, 12>(&self.words, ids),
+            6 => Self::unpack_ids_fixed::<6, 10>(&self.words, ids),
+            7 => Self::unpack_ids_fixed::<7, 9>(&self.words, ids),
+            8 => Self::unpack_ids_fixed::<8, 8>(&self.words, ids),
+            bits => {
+                let per = 64 / usize::from(bits);
+                let m = mask(bits);
+                let shift = u32::from(bits);
+                for (chunk, &word) in ids.chunks_mut(per).zip(&self.words) {
+                    let mut w = word;
+                    for cell in chunk {
+                        *cell = (w & m) as u16;
+                        w >>= shift;
+                    }
+                }
             }
         }
         Some(list)
@@ -1969,6 +2066,189 @@ mod tests {
             println!(
                 "pack {name}: baseline {base:.2} us, new {new:.2} us, {:.2}x",
                 base / new
+            );
+        }
+    }
+
+    fn baseline_pack_words(bits: u8, entries: usize, ids: impl Iterator<Item = u32>) -> Vec<u64> {
+        let mut words = vec![0u64; storage_len(bits, entries)];
+        for (i, id) in ids.enumerate() {
+            write(&mut words, bits, i, id);
+        }
+        words
+    }
+
+    fn baseline_unpack_ids<'a>(
+        container: &'a PalettedContainer,
+        ids: &mut [u16],
+    ) -> Option<&'a [u32]> {
+        let Palette::List(list) = &container.palette else {
+            return None;
+        };
+        assert_eq!(ids.len(), container.strategy.entries());
+        let bits = usize::from(container.bits);
+        let per = 64 / bits;
+        let m = mask(container.bits);
+        for (chunk, &word) in ids.chunks_mut(per).zip(&container.words) {
+            for (slot, cell) in chunk.iter_mut().enumerate() {
+                *cell = ((word >> (slot * bits)) & m) as u16;
+            }
+        }
+        Some(list)
+    }
+
+    #[test]
+    fn pack_words_and_specialized_unpack_match_baseline_across_widths() {
+        for distinct in [2usize, 12, 24, 48, 100, 200, 500] {
+            let values: Vec<u32> = (0..4096).map(|i| (i % distinct) as u32).collect();
+            let c = PalettedContainer::from_values(BLOCKS, &values);
+            let mut got = vec![0u32; 4096];
+            c.unpack(&mut got);
+            assert_eq!(got, values, "unpack distinct={distinct}");
+
+            if let Palette::List(list) = &c.palette {
+                let mut ids_fast = vec![0u16; 4096];
+                let mut ids_base = vec![0u16; 4096];
+                assert_eq!(c.unpack_ids(&mut ids_fast), Some(list.as_slice()));
+                assert_eq!(
+                    baseline_unpack_ids(&c, &mut ids_base),
+                    Some(list.as_slice())
+                );
+                assert_eq!(ids_fast, ids_base, "unpack_ids distinct={distinct}");
+
+                let mut mapped = vec![0u32; 4096];
+                c.unpack_ids_mapped(&mut mapped, list);
+                assert_eq!(mapped, values, "unpack_ids_mapped distinct={distinct}");
+            }
+        }
+        for bits in 1..=16u8 {
+            let m = mask(bits) as u32;
+            let ids: Vec<u32> = (0..4096).map(|i| (i as u32 * 13) & m).collect();
+            assert_eq!(
+                pack_words(bits, 4096, ids.iter().copied()),
+                baseline_pack_words(bits, 4096, ids.iter().copied()),
+                "pack_words bits={bits}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "microbenchmark: cargo test --release -p horizon-core --lib paletted::tests::benchmark_pack_and_unpack_widths -- --ignored --nocapture"]
+    fn benchmark_pack_and_unpack_widths() {
+        use std::{hint::black_box, time::Instant};
+
+        const ROUNDS: u32 = 31;
+        const ITERS: usize = 2000;
+        let median = |v: &[f64]| v[v.len() / 2];
+
+        // 1. pack_words across 4, 5, 6, 8, 15 bits
+        for bits in [4u8, 5, 6, 8, 15] {
+            let m = mask(bits) as u32;
+            let ids: Vec<u32> = (0..4096).map(|i| ((i as u32) * 7) & m).collect();
+            let mut times = [Vec::new(), Vec::new()];
+            for round in 0..ROUNDS {
+                for optimized in [round % 2 == 0, round % 2 != 0] {
+                    let started = Instant::now();
+                    for _ in 0..ITERS {
+                        let w = if optimized {
+                            pack_words(bits, 4096, black_box(&ids).iter().copied())
+                        } else {
+                            baseline_pack_words(bits, 4096, black_box(&ids).iter().copied())
+                        };
+                        black_box(w);
+                    }
+                    if round > 0 {
+                        times[usize::from(optimized)]
+                            .push(started.elapsed().as_secs_f64() * 1e9 / ITERS as f64);
+                    }
+                }
+            }
+            for v in &mut times {
+                v.sort_by(f64::total_cmp);
+            }
+            println!(
+                "pack_words {bits:2}-bit (4096): baseline {:8.1} ns/op  optimized {:8.1} ns/op  speedup {:5.2}x",
+                median(&times[0]),
+                median(&times[1]),
+                median(&times[0]) / median(&times[1])
+            );
+        }
+
+        // 2. unpack across 5-bit, 6-bit, 8-bit list and 16-bit global
+        for (label, distinct) in [
+            ("5-bit list (24)", 24usize),
+            ("6-bit list (48)", 48),
+            ("8-bit list (200)", 200),
+            ("16-bit global (500)", 500),
+        ] {
+            let values: Vec<u32> = (0..4096).map(|i| (i % distinct) as u32).collect();
+            let c = PalettedContainer::from_values(BLOCKS, &values);
+            let mut out = [0u32; 4096];
+            let mut times = [Vec::new(), Vec::new()];
+            for round in 0..ROUNDS {
+                for optimized in [round % 2 == 0, round % 2 != 0] {
+                    let started = Instant::now();
+                    for _ in 0..ITERS {
+                        if optimized {
+                            black_box(&c).unpack(black_box(&mut out));
+                        } else {
+                            baseline_unpack(black_box(&c), black_box(&mut out));
+                        }
+                        black_box(out[4095]);
+                    }
+                    if round > 0 {
+                        times[usize::from(optimized)]
+                            .push(started.elapsed().as_secs_f64() * 1e9 / ITERS as f64);
+                    }
+                }
+            }
+            for v in &mut times {
+                v.sort_by(f64::total_cmp);
+            }
+            println!(
+                "unpack {label:20}: baseline {:8.1} ns/op  optimized {:8.1} ns/op  speedup {:5.2}x",
+                median(&times[0]),
+                median(&times[1]),
+                median(&times[0]) / median(&times[1])
+            );
+        }
+
+        // 3. unpack_ids across 4-bit, 5-bit, 6-bit, 8-bit
+        for (label, distinct) in [
+            ("4-bit (12)", 12usize),
+            ("5-bit (24)", 24),
+            ("6-bit (48)", 48),
+            ("8-bit (200)", 200),
+        ] {
+            let values: Vec<u32> = (0..4096).map(|i| (i % distinct) as u32).collect();
+            let c = PalettedContainer::from_values(BLOCKS, &values);
+            let mut ids = [0u16; 4096];
+            let mut times = [Vec::new(), Vec::new()];
+            for round in 0..ROUNDS {
+                for optimized in [round % 2 == 0, round % 2 != 0] {
+                    let started = Instant::now();
+                    for _ in 0..ITERS {
+                        if optimized {
+                            black_box(black_box(&c).unpack_ids(black_box(&mut ids)));
+                        } else {
+                            black_box(baseline_unpack_ids(black_box(&c), black_box(&mut ids)));
+                        }
+                        black_box(ids[4095]);
+                    }
+                    if round > 0 {
+                        times[usize::from(optimized)]
+                            .push(started.elapsed().as_secs_f64() * 1e9 / ITERS as f64);
+                    }
+                }
+            }
+            for v in &mut times {
+                v.sort_by(f64::total_cmp);
+            }
+            println!(
+                "unpack_ids {label:16}: baseline {:8.1} ns/op  optimized {:8.1} ns/op  speedup {:5.2}x",
+                median(&times[0]),
+                median(&times[1]),
+                median(&times[0]) / median(&times[1])
             );
         }
     }
