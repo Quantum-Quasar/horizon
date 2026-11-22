@@ -189,6 +189,16 @@ impl<B: TerrainBlockStates> HeightmapChunk for TerrainBlocks<'_, B> {
     fn block_state(&self, x: i32, y: i32, z: i32) -> B::State {
         self.properties.heightmap_state(self.block(x, y, z))
     }
+    fn uniform_section(&self, section_y: i32) -> Option<B::State> {
+        let section = self.section_index(section_y)?;
+        if self.non_air[section] == 0 {
+            Some(self.properties.heightmap_state(self.air))
+        } else {
+            self.sections[section]
+                .uniform_state()
+                .map(|state| self.properties.heightmap_state(state))
+        }
+    }
 }
 impl<B: TerrainBlockStates> TerrainBlocks<'_, B> {
     #[inline]
