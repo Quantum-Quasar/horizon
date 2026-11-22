@@ -30,6 +30,27 @@ fn bits_for_palette(len: usize, min: u8) -> u8 {
     }
 }
 
+/// Copies every compound entry except `"palette"` and `"data"`, avoiding a
+/// full clone of the palette list and packed long array in the common case.
+fn extra_fields(
+    map: &Compound,
+    palette_key: &JavaString,
+    data_key: &JavaString,
+    has_data: bool,
+) -> Compound {
+    let known = if has_data { 2 } else { 1 };
+    if map.len() <= known {
+        return Compound::new();
+    }
+    let mut extra = Compound::new();
+    for (k, v) in map {
+        if k != palette_key && k != data_key {
+            extra.insert(k.clone(), v.clone());
+        }
+    }
+    extra
+}
+
 /// `BlockEntity.getPosFromTag(chunk, tag)`: a saved block entity's `x`, `y`,
 /// `z`, moved into `chunk` when the tag names another chunk. Vanilla warns
 /// about such a save and keeps only the low four bits of each coordinate, so
@@ -75,34 +96,56 @@ impl PalettedContainer {
         let Tag::Compound(map) = tag else {
             return Err(invalid("palette container is not a compound"));
         };
-        let Some(Tag::List(palette)) = map.get(&key("palette")) else {
+        let palette_key = key("palette");
+        let Some(Tag::List(palette)) = map.get(&palette_key) else {
             return Err(invalid("missing palette list"));
         };
-        let first = palette.first().ok_or_else(|| invalid("empty palette"))?;
-        let mut result = Self::uniform(first.clone(), entries, min_bits)?;
+        if palette.is_empty() {
+            return Err(invalid("empty palette"));
+        }
+        if entries == 0 || !(1..=32).contains(&min_bits) {
+            return Err(invalid("invalid palette dimensions"));
+        }
         if palette.len() > i32::MAX as usize || palette.iter().any(|t| matches!(t, Tag::End)) {
             return Err(invalid("invalid palette"));
         }
-        result.palette = palette.clone();
         let bits = bits_for_palette(palette.len(), min_bits);
-        if bits > 0 {
-            let Some(Tag::LongArray(words)) = map.get(&key("data")) else {
+        let data_key = key("data");
+        let storage = if bits > 0 {
+            let Some(Tag::LongArray(words)) = map.get(&data_key) else {
                 return Err(invalid("nonuniform palette is missing data"));
             };
             let storage =
                 PackedStorage::from_words(bits, entries, words.iter().map(|&w| w as u64).collect())
                     .map_err(|e| invalid(e.to_string()))?;
-            for index in 0..entries {
-                if storage.get(index).unwrap() as usize >= palette.len() {
+            let palette_len = palette.len();
+            if entries <= 4096 {
+                let mut indices = [0u32; 4096];
+                storage.unpack_into(&mut indices[..entries]);
+                if indices[..entries]
+                    .iter()
+                    .any(|&id| id as usize >= palette_len)
+                {
                     return Err(invalid("palette index outside palette"));
                 }
+            } else if storage
+                .unpack()
+                .into_iter()
+                .any(|id| id as usize >= palette_len)
+            {
+                return Err(invalid("palette index outside palette"));
             }
-            result.storage = Some(storage);
-        }
-        result.extra = map.clone();
-        result.extra.remove(&key("palette"));
-        result.extra.remove(&key("data"));
-        Ok(result)
+            Some(storage)
+        } else {
+            None
+        };
+        Ok(Self {
+            palette: palette.clone(),
+            storage,
+            entries,
+            min_bits,
+            extra: extra_fields(map, &palette_key, &data_key, bits > 0),
+        })
     }
 
     pub fn bits(&self) -> u8 {
@@ -488,23 +531,155 @@ impl<'r> BlockSection<'r> {
         })
     }
     pub fn from_nbt(tag: &Tag, registry: &'r BlockRegistry) -> io::Result<Self> {
-        let container = PalettedContainer::from_nbt(tag, 4096, 4)?;
-        let resolved = container
-            .palette
-            .iter()
-            .map(|tag| registry.resolve(&BlockState::from_nbt(tag)?))
-            .collect::<io::Result<Vec<_>>>()?;
-        let first_index = container.storage.as_ref().map_or(0, |s| s.get(0).unwrap()) as usize;
-        let mut section = Self::uniform(resolved[first_index], registry)?;
-        for index in 0..4096 {
-            let id = container
-                .storage
-                .as_ref()
-                .map_or(0, |s| s.get(index).unwrap()) as usize;
-            section.set(index, resolved[id])?;
+        let Tag::Compound(map) = tag else {
+            return Err(invalid("palette container is not a compound"));
+        };
+        let palette_key = key("palette");
+        let Some(Tag::List(palette_tags)) = map.get(&palette_key) else {
+            return Err(invalid("missing palette list"));
+        };
+        if palette_tags.is_empty() {
+            return Err(invalid("empty palette"));
         }
-        section.extra = container.extra;
-        Ok(section)
+        if palette_tags.len() > i32::MAX as usize
+            || palette_tags.iter().any(|t| matches!(t, Tag::End))
+        {
+            return Err(invalid("invalid palette"));
+        }
+        let bits = bits_for_palette(palette_tags.len(), 4);
+        let data_key = key("data");
+        if bits == 0 {
+            let state = registry.resolve(&BlockState::from_nbt(&palette_tags[0])?)?;
+            let mut section = Self::uniform(state, registry)?;
+            section.extra = extra_fields(map, &palette_key, &data_key, false);
+            return Ok(section);
+        }
+
+        let Some(Tag::LongArray(words)) = map.get(&data_key) else {
+            return Err(invalid("nonuniform palette is missing data"));
+        };
+        let storage =
+            PackedStorage::from_words(bits, 4096, words.iter().map(|&w| w as u64).collect())
+                .map_err(|e| invalid(e.to_string()))?;
+        let mut indices = [0u32; 4096];
+        storage.unpack_into(&mut indices);
+
+        let palette_len = palette_tags.len();
+        let mut counts = vec![0u16; palette_len];
+        for &idx in &indices {
+            let slot = counts
+                .get_mut(idx as usize)
+                .ok_or_else(|| invalid("palette index outside palette"))?;
+            *slot += 1;
+        }
+
+        let resolved = palette_tags
+            .iter()
+            .map(|t| registry.resolve(&BlockState::from_nbt(t)?))
+            .collect::<io::Result<Vec<_>>>()?;
+        let extra = extra_fields(map, &palette_key, &data_key, true);
+
+        let mut live_count = 0usize;
+        let mut first_live = 0usize;
+        let mut has_duplicates = false;
+        if palette_len <= 64 {
+            for (i, (&state, &count)) in resolved.iter().zip(&counts).enumerate() {
+                if count == 0 {
+                    continue;
+                }
+                if live_count == 0 {
+                    first_live = i;
+                } else if !has_duplicates
+                    && resolved[..i]
+                        .iter()
+                        .zip(&counts[..i])
+                        .any(|(&prev, &prev_count)| prev_count != 0 && prev == state)
+                {
+                    has_duplicates = true;
+                }
+                live_count += 1;
+            }
+        } else {
+            let mut seen = HashMap::with_capacity(palette_len);
+            for (i, (&state, &count)) in resolved.iter().zip(&counts).enumerate() {
+                if count == 0 {
+                    continue;
+                }
+                if live_count == 0 {
+                    first_live = i;
+                }
+                if seen.insert(state, i).is_some() {
+                    has_duplicates = true;
+                }
+                live_count += 1;
+            }
+        }
+
+        if live_count == 1 {
+            let mut section = Self::uniform(resolved[first_live], registry)?;
+            section.extra = extra;
+            return Ok(section);
+        }
+
+        if !has_duplicates {
+            let mut free = Vec::new();
+            if live_count < palette_len {
+                free.reserve(palette_len - live_count);
+                for (i, &count) in counts.iter().enumerate() {
+                    if count == 0 {
+                        free.push(i as u32);
+                    }
+                }
+            }
+            return Ok(Self {
+                last: Some((resolved[first_live], first_live as u32)),
+                palette: resolved,
+                counts,
+                free,
+                storage: Some(storage),
+                registry,
+                extra,
+            });
+        }
+
+        // Duplicate live states in NBT palette: merge them into unique live slots.
+        let mut dedup_palette = Vec::with_capacity(live_count);
+        let mut dedup_counts = Vec::with_capacity(live_count);
+        let mut remap = vec![0u32; palette_len];
+        let mut state_to_slot = HashMap::with_capacity(live_count);
+        for (i, (&state, &count)) in resolved.iter().zip(&counts).enumerate() {
+            if count == 0 {
+                continue;
+            }
+            let slot = *state_to_slot.entry(state).or_insert_with(|| {
+                let id = dedup_palette.len() as u32;
+                dedup_palette.push(state);
+                dedup_counts.push(0);
+                id
+            });
+            dedup_counts[slot as usize] += count;
+            remap[i] = slot;
+        }
+        if dedup_palette.len() == 1 {
+            let mut section = Self::uniform(dedup_palette[0], registry)?;
+            section.extra = extra;
+            return Ok(section);
+        }
+        let dedup_bits = bits_for_palette(dedup_palette.len(), 4);
+        let mut dedup_storage =
+            PackedStorage::new(dedup_bits, 4096).map_err(|e| invalid(e.to_string()))?;
+        for (i, &old_id) in indices.iter().enumerate() {
+            dedup_storage.write(i, remap[old_id as usize]);
+        }
+        Ok(Self {
+            last: Some((dedup_palette[0], 0)),
+            palette: dedup_palette,
+            counts: dedup_counts,
+            free: Vec::new(),
+            storage: Some(dedup_storage),
+            registry,
+            extra,
+        })
     }
     /// Test current distinct states without unpacking all 4,096 cells. The
     /// predicate should be pure; unused palette slots are intentionally skipped.

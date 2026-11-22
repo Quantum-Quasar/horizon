@@ -597,3 +597,209 @@ fn a_block_entity_saved_in_another_chunk_moves_into_this_one() {
         (-27, 70, 93)
     );
 }
+
+fn baseline_block_section_from_nbt<'r>(
+    tag: &Tag,
+    registry: &'r BlockRegistry,
+) -> io::Result<BlockSection<'r>> {
+    let Tag::Compound(map) = tag else {
+        return Err(invalid("palette container is not a compound"));
+    };
+    let Some(Tag::List(palette)) = map.get(&key("palette")) else {
+        return Err(invalid("missing palette list"));
+    };
+    let first = palette.first().ok_or_else(|| invalid("empty palette"))?;
+    let mut container = PalettedContainer::uniform(first.clone(), 4096, 4)?;
+    if palette.len() > i32::MAX as usize || palette.iter().any(|t| matches!(t, Tag::End)) {
+        return Err(invalid("invalid palette"));
+    }
+    container.palette = palette.clone();
+    let bits = bits_for_palette(palette.len(), 4);
+    if bits > 0 {
+        let Some(Tag::LongArray(words)) = map.get(&key("data")) else {
+            return Err(invalid("nonuniform palette is missing data"));
+        };
+        let storage =
+            PackedStorage::from_words(bits, 4096, words.iter().map(|&w| w as u64).collect())
+                .map_err(|e| invalid(e.to_string()))?;
+        for index in 0..4096 {
+            if storage.get(index).unwrap() as usize >= palette.len() {
+                return Err(invalid("palette index outside palette"));
+            }
+        }
+        container.storage = Some(storage);
+    }
+    container.extra = map.clone();
+    container.extra.remove(&key("palette"));
+    container.extra.remove(&key("data"));
+
+    let resolved = container
+        .palette
+        .iter()
+        .map(|tag| registry.resolve(&BlockState::from_nbt(tag)?))
+        .collect::<io::Result<Vec<_>>>()?;
+    let first_index = container.storage.as_ref().map_or(0, |s| s.get(0).unwrap()) as usize;
+    let mut section = BlockSection::uniform(resolved[first_index], registry)?;
+    for index in 0..4096 {
+        let id = container
+            .storage
+            .as_ref()
+            .map_or(0, |s| s.get(index).unwrap()) as usize;
+        section.set(index, resolved[id])?;
+    }
+    section.extra = container.extra;
+    Ok(section)
+}
+
+/// Direct `BlockSection::from_nbt` matches the baseline `set`-replay load across
+/// uniform, mixed, unused-slot, duplicate-palette, and extra-field sections.
+#[test]
+fn block_section_from_nbt_matches_set_replay() {
+    let registry = benchmark_registry(64);
+    let state_tag = |id: u32| registry.state(BlockStateId(id)).unwrap().to_nbt();
+
+    // 1. Uniform section with an extra key.
+    let mut uniform_tag = BlockSection::uniform(BlockStateId(3), &registry)
+        .unwrap()
+        .to_nbt()
+        .unwrap();
+    if let Tag::Compound(map) = &mut uniform_tag {
+        map.insert(key("custom"), Tag::Int(42));
+    }
+
+    // 2. Typical 5-bit section (24 states).
+    let mut mixed = BlockSection::uniform(BlockStateId(0), &registry).unwrap();
+    for i in 0..4096 {
+        mixed.set(i, BlockStateId((i % 24) as u32)).unwrap();
+    }
+    let mixed_tag = mixed.to_nbt().unwrap();
+
+    // 3. Unused palette slot that leaves only 1 live state (must collapse to uniform).
+    let unused_uniform_tag = Tag::compound([
+        ("palette", Tag::List(vec![state_tag(0), state_tag(1)])),
+        ("data", Tag::LongArray(vec![0; 256])),
+    ]);
+
+    // 4. Duplicate palette entries resolving to the same BlockStateId.
+    let mut dup_storage = PackedStorage::new(4, 4096).unwrap();
+    for i in 0..4096 {
+        dup_storage.set(i, (i % 3) as u32).unwrap();
+    }
+    let dup_tag = Tag::compound([
+        (
+            "palette",
+            Tag::List(vec![state_tag(2), state_tag(2), state_tag(5)]),
+        ),
+        (
+            "data",
+            Tag::LongArray(dup_storage.words().iter().map(|&w| w as i64).collect()),
+        ),
+    ]);
+
+    for (label, tag) in [
+        ("uniform", uniform_tag),
+        ("mixed-24", mixed_tag),
+        ("unused-to-uniform", unused_uniform_tag),
+        ("duplicate-palette", dup_tag),
+    ] {
+        let mut base = baseline_block_section_from_nbt(&tag, &registry).unwrap();
+        let mut fast = BlockSection::from_nbt(&tag, &registry).unwrap();
+        assert_eq!(fast.extra, base.extra, "{label}: extra");
+        assert_eq!(
+            fast.storage.is_none(),
+            base.storage.is_none(),
+            "{label}: uniform"
+        );
+        for i in 0..4096 {
+            assert_eq!(
+                fast.get(i).unwrap(),
+                base.get(i).unwrap(),
+                "{label}: cell {i}"
+            );
+        }
+        // Subsequent edits must agree too.
+        for i in [0usize, 17, 255, 2048, 4095] {
+            let new_state = BlockStateId(((i * 7 + 1) % 32) as u32);
+            assert_eq!(
+                fast.set(i, new_state).unwrap(),
+                base.set(i, new_state).unwrap(),
+                "{label}: set {i}"
+            );
+        }
+        for i in 0..4096 {
+            assert_eq!(
+                fast.get(i).unwrap(),
+                base.get(i).unwrap(),
+                "{label}: post-set {i}"
+            );
+        }
+    }
+
+    // Invalid palette index must still error.
+    let bad = Tag::compound([
+        ("palette", Tag::List(vec![state_tag(0), state_tag(1)])),
+        ("data", Tag::LongArray(vec![-1; 256])),
+    ]);
+    assert!(BlockSection::from_nbt(&bad, &registry).is_err());
+}
+
+#[test]
+#[ignore = "microbenchmark: cargo test --release -p horizon-world --lib chunk::tests::benchmark_block_section_from_nbt -- --ignored --nocapture"]
+fn benchmark_block_section_from_nbt() {
+    use std::hint::black_box;
+    use std::time::Instant;
+
+    const ROUNDS: u32 = 31;
+    const ITERS: usize = 200;
+    let registry = benchmark_registry(64);
+    let make_tag = |states: u32| {
+        let mut section = BlockSection::uniform(BlockStateId(0), &registry).unwrap();
+        if states > 1 {
+            let mut rng = 0x517c_c1b7_2722_0a95u64 ^ u64::from(states);
+            for i in 0..4096 {
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                section.set(i, BlockStateId((rng as u32) % states)).unwrap();
+            }
+        }
+        section.to_nbt().unwrap()
+    };
+
+    for (label, states) in [
+        ("uniform (1 state)", 1),
+        ("4-bit (12 states)", 12),
+        ("5-bit (24 states)", 24),
+        ("6-bit (48 states)", 48),
+    ] {
+        let tag = make_tag(states);
+        let mut times = [Vec::new(), Vec::new()];
+        for round in 0..ROUNDS {
+            for optimized in [round % 2 == 0, round % 2 != 0] {
+                let started = Instant::now();
+                for _ in 0..ITERS {
+                    let s = if optimized {
+                        BlockSection::from_nbt(black_box(&tag), &registry).unwrap()
+                    } else {
+                        baseline_block_section_from_nbt(black_box(&tag), &registry).unwrap()
+                    };
+                    black_box(&s);
+                }
+                if round > 0 {
+                    times[usize::from(optimized)]
+                        .push(started.elapsed().as_secs_f64() * 1e6 / ITERS as f64);
+                }
+            }
+        }
+        for v in &mut times {
+            v.sort_by(f64::total_cmp);
+        }
+        let median = |v: &[f64]| v[v.len() / 2];
+        println!(
+            "from_nbt {label:18}: baseline {:7.3} us/op  optimized {:7.3} us/op  speedup {:6.2}x",
+            median(&times[0]),
+            median(&times[1]),
+            median(&times[0]) / median(&times[1])
+        );
+    }
+}
