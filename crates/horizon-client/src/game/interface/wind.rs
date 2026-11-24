@@ -1199,6 +1199,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "daily"]
     fn wind_burst_plays_on_blocks_sound_source() {
         crate::game::native_entity_refs::tests::with_game(|game| {
             game.audio.capture = Some(Vec::new());
