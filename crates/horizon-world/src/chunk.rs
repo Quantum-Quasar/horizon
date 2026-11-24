@@ -49,6 +49,10 @@ pub fn block_entity_pos(pos: (i32, i32, i32), chunk: [i32; 2]) -> (i32, i32, i32
 #[derive(Clone, Debug)]
 pub struct PalettedContainer {
     palette: Vec<Tag>,
+    // Only loaded input can contain equal tags in multiple slots. Remember the
+    // first slot of each such tag without changing the stored ids or bit width.
+    // New slots appended by `set` are already unique and need no entry here.
+    aliases: Option<Box<[u32]>>,
     storage: Option<PackedStorage>,
     entries: usize,
     min_bits: u8,
@@ -64,6 +68,7 @@ impl PalettedContainer {
         }
         Ok(Self {
             palette: vec![value],
+            aliases: None,
             storage: None,
             entries,
             min_bits,
@@ -97,6 +102,7 @@ impl PalettedContainer {
                     return Err(invalid("palette index outside palette"));
                 }
             }
+            result.aliases = duplicate_palette_slots(palette);
             result.storage = Some(storage);
         }
         result.extra = map.clone();
@@ -208,6 +214,8 @@ impl PalettedContainer {
             Some(packed)
         };
         self.palette = new_palette;
+        // The rebuilt palette holds each tag once, so no slot aliases another.
+        self.aliases = None;
         Ok(())
     }
 
@@ -222,34 +230,58 @@ impl PalettedContainer {
             map.insert(key("palette"), Tag::List(vec![self.palette[0].clone()]));
             return Tag::Compound(map);
         };
-        let mut stack = [0u32; 4096];
-        let mut heap;
-        let indices: &mut [u32] = if self.entries <= stack.len() {
-            let slice = &mut stack[..self.entries];
-            storage.unpack_into(slice);
-            slice
-        } else {
-            heap = storage.unpack();
-            &mut heap
-        };
-        let palette = Self::remap_first_use(&self.palette, indices);
+        let mut ids = storage.unpack();
+        if let Some(aliases) = &self.aliases {
+            for id in &mut ids {
+                if let Some(&first) = aliases.get(*id as usize) {
+                    *id = first;
+                }
+            }
+        }
+        let mut palette = Vec::with_capacity(self.palette.len().min(self.entries));
+        let mut remap = vec![u32::MAX; self.palette.len()];
+        for id in &mut ids {
+            let saved = &mut remap[*id as usize];
+            if *saved == u32::MAX {
+                *saved = palette.len() as u32;
+                palette.push(self.palette[*id as usize].clone());
+            }
+            *id = *saved;
+        }
         let bits = bits_for_palette(palette.len(), self.min_bits);
-        map.insert(
-            key("palette"),
-            Tag::List(palette.into_iter().cloned().collect()),
-        );
+        map.insert(key("palette"), Tag::List(palette));
         if bits > 0 {
-            let mut packed = PackedStorage::new(bits, self.entries).unwrap();
-            for (index, &id) in indices.iter().enumerate() {
-                packed.write(index, id);
+            let mut storage = PackedStorage::new(bits, self.entries).unwrap();
+            for (index, id) in ids.into_iter().enumerate() {
+                storage.set(index, id).unwrap();
             }
             map.insert(
                 key("data"),
-                Tag::LongArray(packed.words().iter().map(|&v| v as i64).collect()),
+                Tag::LongArray(storage.words().iter().map(|&v| v as i64).collect()),
             );
         }
         Tag::Compound(map)
     }
+}
+
+/// Resolve duplicate imported palette tags once, not once per cell on every save.
+fn duplicate_palette_slots(palette: &[Tag]) -> Option<Box<[u32]>> {
+    use std::collections::hash_map::Entry;
+
+    let mut seen = HashMap::with_capacity(palette.len());
+    let mut aliases: Option<Box<[u32]>> = None;
+    for (id, tag) in (0u32..).zip(palette) {
+        match seen.entry(tag) {
+            Entry::Vacant(slot) => {
+                slot.insert(id);
+            }
+            Entry::Occupied(slot) => {
+                let aliases = aliases.get_or_insert_with(|| (0..palette.len() as u32).collect());
+                aliases[id as usize] = *slot.get();
+            }
+        }
+    }
+    aliases
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
