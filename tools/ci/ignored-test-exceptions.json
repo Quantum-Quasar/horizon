@@ -1242,6 +1242,14 @@
   {
     "package": "horizon-world",
     "target": "lib",
+    "test": "heightmap::tests::benchmark_heightmap_prime",
+    "path": "crates/horizon-world/src/heightmap.rs",
+    "reason": "microbenchmark: cargo test --release -p horizon-world --lib heightmap::tests::benchmark_heightmap_prime -- --ignored --nocapture",
+    "rationale": "Opt-in measurement, not an ordinary daily correctness check: microbenchmark. Run by hand on an idle machine with the optimized profile; all assertions remain in the test."
+  },
+  {
+    "package": "horizon-world",
+    "target": "lib",
     "test": "worldgen::terrain::tests::benchmark_fill_noise",
     "path": "crates/horizon-world/src/worldgen/terrain.rs",
     "reason": "benchmark",
