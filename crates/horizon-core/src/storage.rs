@@ -490,7 +490,8 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "microbenchmark: cargo test --release -p horizon-core --lib storage::tests::benchmark_unpack -- --ignored --nocapture"]
+    // cargo test --release -p horizon-core --lib storage::tests::benchmark_unpack -- --ignored --nocapture
+    #[ignore = "microbenchmark; run with --ignored --nocapture"]
     fn benchmark_unpack() {
         use std::hint::black_box;
         use std::time::Instant;
