@@ -617,6 +617,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "daily"]
     fn movement_stats_uses_current_on_climbable_branch() {
         crate::game::native_entity_refs::tests::with_game(|game| {
             game.world.chunks.insert(
